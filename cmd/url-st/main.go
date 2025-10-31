@@ -35,7 +35,7 @@ func main() {
 		log.Error("failed to init storage", sl.Err(err))
 		os.Exit(1)
 	}
-
+	// xn
 	_ = storage
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
