@@ -18,115 +18,51 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v2
         with:
-          fetch-depth: 0
-          ref: refs/heads/main
-
-      - name: Verify tag exists
+          ref: ${{ github.event.inputs.tag }}
+      - name: Check if tag exists
         run: |
-          git fetch --all --tags --prune
-          TAG="${{ github.event.inputs.tag }}"
-          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "❌ Error: Tag '$TAG' not found"
-            echo "Available tags:"
-            git tag | head -10
+          git fetch --all --tags
+          if ! git tag | grep -q "^${{ github.event.inputs.tag }}$"; then
+            echo "error: Tag '${{ github.event.inputs.tag }}' not found"
             exit 1
           fi
-          echo "✅ Tag '$TAG' found"
-
-      - name: Checkout tag
-        run: |
-          git checkout ${{ github.event.inputs.tag }}
-
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v2
         with:
-          go-version-file: go.mod
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Download dependencies
-        run: go mod download
-
+          go-version: 1.20.2
       - name: Build app
         run: |
-          cd cmd/url-st
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o url-shortener -ldflags="-s -w" .
+          go mod download
+          go build -o url-shortener ./cmd/url-shortener
+      - name: Deploy to VM
+        run: |
+          sudo apt-get install -y ssh rsync
+          echo "$DEPLOY_SSH_KEY" > deploy_key.pem
+          chmod 600 deploy_key.pem
+          ssh -i deploy_key.pem -o StrictHostKeyChecking=no ${{ env.HOST }} "mkdir -p ${{ env.DEPLOY_DIRECTORY }}"
+          rsync -avz -e 'ssh -i deploy_key.pem -o StrictHostKeyChecking=no' --exclude='.git' ./ ${{ env.HOST }}:${{ env.DEPLOY_DIRECTORY }}
         env:
-          CGO_ENABLED: 1
-      - name: Setup SSH
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      - name: Remove old systemd service file
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 188.68.206.139 >> ~/.ssh/known_hosts || true
-
-      - name: Install rsync
-        run: sudo apt-get update && sudo apt-get install -y rsync openssh-client
-
-      - name: Create deployment directory on server
+          ssh -i deploy_key.pem -o StrictHostKeyChecking=no ${{ env.HOST }} "rm -f /etc/systemd/system/url-shortener.service"
+      - name: List workspace contents
         run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ env.HOST }} \
-            "mkdir -p ${{ env.DEPLOY_DIRECTORY }}/config ${{ env.DEPLOY_DIRECTORY }}/storage"
-
-      - name: Copy application binary
-        run: |
-          rsync -avz -e 'ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no' \
-            cmd/url-st/url-shortener \
-            ${{ env.HOST }}:${{ env.DEPLOY_DIRECTORY }}/url-shortener
-      - name: Copy configuration files
-        run: |
-          rsync -avz -e 'ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no' \
-            config/prod.yaml \
-            ${{ env.HOST }}:${{ env.DEPLOY_DIRECTORY }}/config/prod.yaml
-
-      - name: Copy systemd service file
-        run: |
-          if [ -f ".github/workflows/deployment/url-shortener.service" ]; then
-            SERVICE_FILE=".github/workflows/deployment/url-shortener.service"
-          elif [ -f "cmd/url-st/.github/workflows/deployment/url-shortener.service" ]; then
-            SERVICE_FILE="cmd/url-st/.github/workflows/deployment/url-shortener.service"
-          else
-            echo "❌ Service file not found"
-            exit 1
-          fi
-          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-            $SERVICE_FILE \
-            ${{ env.HOST }}:/tmp/url-shortener.service
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ env.HOST }} \
-            "sudo mv /tmp/url-shortener.service /etc/systemd/system/url-shortener.service"
-
+          echo "Listing deployment folder contents:"
+          ls -la ${{ github.workspace }}/deployment
       - name: Create environment file on server
         run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ env.HOST }} \
-            "sudo bash -c 'touch ${{ env.ENV_FILE_PATH }} && \
-            chmod 600 ${{ env.ENV_FILE_PATH }} && \
-            echo \"CONFIG_PATH=${{ env.CONFIG_PATH }}\" > ${{ env.ENV_FILE_PATH }} && \
-            echo \"HTTP_SERVER_PASSWORD=${{ secrets.AUTH_PASS }}\" >> ${{ env.ENV_FILE_PATH }}'"
-
-      - name: Set executable permissions
+          ssh -i deploy_key.pem -o StrictHostKeyChecking=no ${{ env.HOST }} "\
+          touch ${{ env.ENV_FILE_PATH }} && \
+          chmod 600 ${{ env.ENV_FILE_PATH }} && \
+          echo 'CONFIG_PATH=${{ env.CONFIG_PATH }}' > ${{ env.ENV_FILE_PATH }} && \
+          echo 'HTTP_SERVER_PASSWORD=${{ secrets.AUTH_PASS }}' >> ${{ env.ENV_FILE_PATH }}"
+      - name: Copy systemd service file
         run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ env.HOST }} \
-            "chmod +x ${{ env.DEPLOY_DIRECTORY }}/url-shortener"
-
-      - name: Reload systemd and restart service
+          scp -i deploy_key.pem -o StrictHostKeyChecking=no ${{ github.workspace }}/deployment/url-shortener.service ${{ env.HOST }}:/tmp/url-shortener.service
+          ssh -i deploy_key.pem -o StrictHostKeyChecking=no ${{ env.HOST }} "mv /tmp/url-shortener.service /etc/systemd/system/url-shortener.service"
+      - name: Start application
         run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ env.HOST }} \
-            "sudo systemctl daemon-reload && \
-            sudo systemctl enable url-shortener.service && \
-            sudo systemctl restart url-shortener.service && \
-            sleep 3"
-
-      - name: Verify deployment
-        run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ env.HOST }} \
-            "systemctl is-active url-shortener.service && \
-            systemctl status url-shortener.service --no-pager -l || \
-            (echo '❌ Service is not active!' && journalctl -u url-shortener.service -n 50 --no-pager && exit 1)"
+          ssh -i deploy_key.pem -o StrictHostKeyChecking=no ${{ env.HOST }} "systemctl daemon-reload && systemctl restart url-shortener.service"
